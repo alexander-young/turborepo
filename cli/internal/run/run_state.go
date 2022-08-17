@@ -1,8 +1,8 @@
 package run
 
 import (
+	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"sync"
@@ -30,10 +30,6 @@ type RunResult struct {
 	Status RunResultStatus
 	// Error, only populated for failure statuses
 	Err error
-	// Description of what's going on right now.
-	Description string
-	// Test results
-	// Tests TestSuite
 }
 
 // RunResultStatus represents the status of a target when we log a build result.
@@ -46,11 +42,27 @@ const (
 	TargetBuilt
 	TargetCached
 	TargetBuildFailed
-	TargetTesting
-	TargetTestStopped
-	TargetTested
-	TargetTestFailed
+	TargetNonexistent
 )
+
+func (rr RunResultStatus) String() string {
+	switch rr {
+	case TargetBuilding:
+		return "running"
+	case TargetBuildStopped:
+		return "stopped"
+	case TargetBuilt:
+		return "executed"
+	case TargetCached:
+		return "replayed"
+	case TargetBuildFailed:
+		return "failed"
+	case TargetNonexistent:
+		return "nonexistent"
+	default:
+		panic(fmt.Sprintf("unknown status: %v", int(rr)))
+	}
+}
 
 type BuildTargetState struct {
 	StartAt time.Time
@@ -62,8 +74,6 @@ type BuildTargetState struct {
 	Status RunResultStatus
 	// Error, only populated for failure statuses
 	Err error
-	// Description of what's going on right now.
-	Description string
 }
 
 type RunState struct {
@@ -108,44 +118,17 @@ func (r *RunState) Run(label string) func(outcome RunResultStatus, err error) {
 	tracer := chrometracing.Event(label)
 	return func(outcome RunResultStatus, err error) {
 		defer tracer.Done()
-		switch {
-		case outcome == TargetBuildFailed:
-			r.add(&RunResult{
-				Time:        time.Now(),
-				Duration:    time.Since(start),
-				Label:       label,
-				Status:      TargetBuildFailed,
-				Err:         fmt.Errorf("running %v failed: %w", label, err),
-				Description: fmt.Sprintf("running %v failed", label),
-			}, label, false)
-		case outcome == TargetCached:
-			r.add(&RunResult{
-				Time:        time.Now(),
-				Duration:    time.Since(start),
-				Label:       label,
-				Description: label + " cached",
-				Status:      TargetCached,
-			}, label, false)
-		case outcome == TargetBuildStopped:
-			r.add(&RunResult{
-				Time:        time.Now(),
-				Duration:    time.Since(start),
-				Label:       label,
-				Description: label + " stopped",
-				Status:      TargetBuildStopped,
-			}, label, false)
-		case outcome == TargetBuilt:
-			r.add(&RunResult{
-				Time:        time.Now(),
-				Duration:    time.Since(start),
-				Label:       label,
-				Description: label + " complete",
-				Status:      TargetBuilt,
-			}, label, false)
-		default:
-			log.Fatalf("Invalid build outcome")
+		now := time.Now()
+		result := &RunResult{
+			Time:     now,
+			Duration: now.Sub(start),
+			Label:    label,
+			Status:   outcome,
 		}
-
+		if err != nil {
+			result.Err = fmt.Errorf("running %v failed: %w", label, err)
+		}
+		r.add(result, label, false)
 	}
 }
 
@@ -155,16 +138,14 @@ func (r *RunState) add(result *RunResult, previous string, active bool) {
 	if s, ok := r.state[result.Label]; ok {
 		s.Status = result.Status
 		s.Err = result.Err
-		s.Description = result.Description
 		s.Duration = result.Duration
 	} else {
 		r.state[result.Label] = &BuildTargetState{
-			StartAt:     result.Time,
-			Label:       result.Label,
-			Status:      result.Status,
-			Err:         result.Err,
-			Description: result.Description,
-			Duration:    result.Duration,
+			StartAt:  result.Time,
+			Label:    result.Label,
+			Status:   result.Status,
+			Err:      result.Err,
+			Duration: result.Duration,
 		}
 		r.Ordered = append(r.Ordered, result.Label)
 	}
@@ -225,8 +206,67 @@ func (r *RunState) Render(ui cli.Ui, startAt time.Time, renderCount int, lineBuf
 	}
 }
 
-func (r *RunState) Close(Ui cli.Ui, filename string) error {
+func (r *RunState) Close(terminal cli.Ui, filename string, summaryPath fs.AbsolutePath) error {
+	endedAt := time.Now()
+	if err := writeChrometracing(filename, terminal); err != nil {
+		terminal.Error(fmt.Sprintf("Error writing tracing data: %v", err))
+	}
+
+	if err := r.writeSummary(summaryPath, endedAt); err != nil {
+		terminal.Error(fmt.Sprintf("Error writing run summary: %v", err))
+	}
+
+	maybeFullTurbo := ""
+	if r.Cached == r.Attempted && r.Attempted > 0 {
+		maybeFullTurbo = ui.Rainbow(">>> FULL TURBO")
+	}
+	terminal.Output("") // Clear the line
+	terminal.Output(util.Sprintf("${BOLD} Tasks:${BOLD_GREEN}    %v successful${RESET}${GRAY}, %v total${RESET}", r.Cached+r.Success, r.Attempted))
+	terminal.Output(util.Sprintf("${BOLD}Cached:    %v cached${RESET}${GRAY}, %v total${RESET}", r.Cached, r.Attempted))
+	terminal.Output(util.Sprintf("${BOLD}  Time:    %v${RESET} %v${RESET}", endedAt.Sub(r.startedAt).Truncate(time.Millisecond), maybeFullTurbo))
+	terminal.Output("")
+	return nil
+}
+
+func (r *RunState) writeSummary(summaryPath fs.AbsolutePath, endedAt time.Time) error {
+	if err := summaryPath.EnsureDir(); err != nil {
+		return err
+	}
+	summary := make(map[string]interface{})
+	summary["sessionId"] = r.sessionID.String()
+	summary["startedAt"] = r.startedAt.UnixMilli()
+	summary["endedAt"] = endedAt.UnixMilli()
+	summary["durationMs"] = endedAt.Sub(r.startedAt).Milliseconds()
+	tasks := make(map[string]interface{})
+	for task, targetState := range r.state {
+		taskSummary := make(map[string]interface{})
+		taskSummary["startedAt"] = targetState.StartAt.UnixMilli()
+		taskSummary["endedAt"] = targetState.StartAt.Add(targetState.Duration).UnixMilli()
+		taskSummary["durationMs"] = targetState.Duration.Milliseconds()
+		taskSummary["status"] = targetState.Status.String()
+		if targetState.Err != nil {
+			taskSummary["error"] = targetState.Err.Error()
+		}
+		tasks[task] = taskSummary
+	}
+	summary["tasks"] = tasks
+	bytes, err := json.MarshalIndent(summary, "", "\t")
+	if err != nil {
+		return err
+	}
+	if err := summaryPath.WriteFile(bytes, 0644); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeChrometracing(filename string, terminal cli.Ui) error {
 	outputPath := chrometracing.Path()
+	if outputPath == "" {
+		// tracing wasn't enabled
+		return nil
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -238,23 +278,11 @@ func (r *RunState) Close(Ui cli.Ui, filename string) error {
 	if filename != "" {
 		name = filename
 	}
-	if outputPath != "" {
-		if err := chrometracing.Close(); err != nil {
-			Ui.Warn(fmt.Sprintf("Failed to flush tracing data: %v", err))
-		}
-		if err := fs.CopyFile(&fs.LstatCachedFile{Path: fs.ResolveUnknownPath(root, outputPath)}, name); err != nil {
-			return err
-		}
+	if err := chrometracing.Close(); err != nil {
+		terminal.Warn(fmt.Sprintf("Failed to flush tracing data: %v", err))
 	}
-
-	maybeFullTurbo := ""
-	if r.Cached == r.Attempted && r.Attempted > 0 {
-		maybeFullTurbo = ui.Rainbow(">>> FULL TURBO")
+	if err := fs.CopyFile(&fs.LstatCachedFile{Path: fs.ResolveUnknownPath(root, outputPath)}, name); err != nil {
+		return err
 	}
-	Ui.Output("") // Clear the line
-	Ui.Output(util.Sprintf("${BOLD} Tasks:${BOLD_GREEN}    %v successful${RESET}${GRAY}, %v total${RESET}", r.Cached+r.Success, r.Attempted))
-	Ui.Output(util.Sprintf("${BOLD}Cached:    %v cached${RESET}${GRAY}, %v total${RESET}", r.Cached, r.Attempted))
-	Ui.Output(util.Sprintf("${BOLD}  Time:    %v${RESET} %v${RESET}", time.Since(r.startedAt).Truncate(time.Millisecond), maybeFullTurbo))
-	Ui.Output("")
 	return nil
 }
